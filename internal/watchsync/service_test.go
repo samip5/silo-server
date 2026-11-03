@@ -2061,6 +2061,80 @@ func TestServiceImportWatchedDeduplicatesResolvedLeavesAtNewestTimestamp(t *test
 	}
 }
 
+func TestServiceImportWatchedSkipsProviderEchoOfLocalPlayback(t *testing.T) {
+	playedAt := time.Date(2026, 11, 1, 2, 8, 6, 0, time.UTC)
+	tests := []struct {
+		name         string
+		localSource  userstore.WatchHistorySource
+		wantImported int
+	}{
+		// Simkl stamps a scrobbled stop when it arrives, seconds after the play.
+		{name: "echo of a local play", localSource: userstore.WatchHistorySourcePlayback, wantImported: 0},
+		// Only local playback is scrobbled, so only it can come back as an echo.
+		{name: "near another source's play", localSource: userstore.WatchHistorySourceMDBList, wantImported: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openUserDB(t)
+			if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+				ID:          "history-local",
+				ProfileID:   "profile-1",
+				MediaItemID: testMovieMediaID,
+				WatchedAt:   playedAt.Format(time.RFC3339),
+				Completed:   true,
+				Source:      tt.localSource,
+			}); err != nil {
+				t.Fatalf("AddHistory: %v", err)
+			}
+			remoteAt := playedAt.Add(6 * time.Second)
+			provider := watchedImporterStub{
+				historyStubBase: historyStubBase{key: "simkl", source: userstore.WatchHistorySourceSimkl},
+				rows: []RemoteWatch{{
+					Provider: "simkl", Kind: historyimport.KindMovie, Title: "Inception", LastWatchedAt: &remoteAt,
+				}},
+			}
+			service := NewService(newServiceFakeRepo(), NewRegistry()).
+				WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+				WithDefaultWatchState(staticStoreProvider{store: userdb.NewSQLiteUserStore(db)})
+
+			result, err := service.ImportWatched(t.Context(), Connection{
+				ID: "conn-1", Provider: "simkl", UserID: 7, ProfileID: "profile-1",
+			}, ServerConfig{}, provider)
+			if err != nil {
+				t.Fatalf("ImportWatched: %v", err)
+			}
+			history, err := userdb.ListHistory(db, "profile-1", 10, 0)
+			if err != nil {
+				t.Fatalf("ListHistory: %v", err)
+			}
+			if result.Imported != tt.wantImported || len(history) != 1+tt.wantImported {
+				t.Fatalf("result = %+v, history = %+v, want %d imported", result, history, tt.wantImported)
+			}
+		})
+	}
+}
+
+func TestEchoesLocalPlaybackWindow(t *testing.T) {
+	playedAt := time.Date(2026, 11, 1, 2, 8, 6, 0, time.UTC)
+	tests := []struct {
+		name     string
+		gap      time.Duration
+		duration float64
+		want     bool
+	}{
+		{name: "inside the window", gap: -4 * time.Minute, duration: 2700, want: true},
+		{name: "past the window", gap: 6 * time.Minute, duration: 2700, want: false},
+		{name: "short item played again", gap: 2 * time.Minute, duration: 180, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := echoesLocalPlayback([]time.Time{playedAt}, playedAt.Add(tt.gap), tt.duration); got != tt.want {
+				t.Fatalf("echoesLocalPlayback(gap %v, duration %v) = %v, want %v", tt.gap, tt.duration, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestServiceSyncConnectionPreservesConnectionUpdatesAcrossFlows(t *testing.T) {
 	db := openUserDB(t)
 	if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{

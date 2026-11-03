@@ -1220,9 +1220,16 @@ func (s *Service) ImportWatched(
 		mediaItemIDs = append(mediaItemIDs, mediaItemID)
 	}
 	sort.Strings(mediaItemIDs)
+	localPlays, err := s.localPlaybackTimes(ctx, conn, mediaItemIDs)
+	if err != nil {
+		return result, err
+	}
 	for _, mediaItemID := range mediaItemIDs {
 		leaf := matchedLeaves[mediaItemID]
 		duration, _ := s.mediaDuration(ctx, leaf.match.MediaItemID)
+		if echoesLocalPlayback(localPlays[mediaItemID], leaf.watchedAt, duration) {
+			continue
+		}
 		watchedAt := leaf.watchedAt
 		created, err := s.watchState.RecordImportedWatchIfNewerWithSource(
 			ctx,
@@ -1401,6 +1408,62 @@ func mergeSyncCursors(existing map[string]string, updates map[string]string) map
 		merged[key] = value
 	}
 	return merged
+}
+
+// scrobbleEchoWindow bounds how far a provider's watch time can sit from the
+// local play it echoes. A provider stamps a scrobbled stop when the request
+// arrives, seconds after Silo recorded the play, so the import's same-second
+// history match misses it and the play would be counted twice.
+const scrobbleEchoWindow = 5 * time.Minute
+
+// localPlaybackTimes lists the completed local playback times of each media
+// item, which ImportWatched compares imported watches against.
+func (s *Service) localPlaybackTimes(ctx context.Context, conn Connection, mediaItemIDs []string) (map[string][]time.Time, error) {
+	if len(mediaItemIDs) == 0 || s.storeProvider == nil {
+		// An empty media filter would read the whole history.
+		return nil, nil
+	}
+	store, err := s.storeProvider.ForUser(ctx, conn.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("open user store: %w", err)
+	}
+	rows, err := listAllCompletedHistory(ctx, store, userstore.CompletedHistoryQuery{
+		ProfileID:      conn.ProfileID,
+		MediaItemIDs:   mediaItemIDs,
+		IncludeSources: []userstore.WatchHistorySource{userstore.WatchHistorySourcePlayback},
+	})
+	if err != nil {
+		return nil, err
+	}
+	plays := make(map[string][]time.Time, len(rows))
+	for _, row := range rows {
+		watchedAt, err := time.Parse(time.RFC3339Nano, row.WatchedAt)
+		if err != nil {
+			continue
+		}
+		plays[row.MediaItemID] = append(plays[row.MediaItemID], watchedAt)
+	}
+	return plays, nil
+}
+
+// echoesLocalPlayback reports whether an imported watch at watchedAt is a
+// provider's copy of one of the local plays. The window is capped at half the
+// item's runtime, so two real plays of a short item never merge.
+func echoesLocalPlayback(localPlays []time.Time, watchedAt time.Time, durationSeconds float64) bool {
+	window := scrobbleEchoWindow
+	if durationSeconds > 0 {
+		window = min(window, time.Duration(durationSeconds*float64(time.Second)/2))
+	}
+	for _, played := range localPlays {
+		gap := watchedAt.Sub(played)
+		if gap < 0 {
+			gap = -gap
+		}
+		if gap <= window {
+			return true
+		}
+	}
+	return false
 }
 
 type completedHistoryLister interface {
